@@ -15,12 +15,14 @@
 #include <string>
 
 #include "gmock/gmock.h"
+#include "gtest/gtest.h"
 #include "test/link/linker_fixture.h"
 
 namespace spvtools {
 namespace {
 
 using ::testing::HasSubstr;
+using ::testing::MatchesRegex;
 using MatchingImportsToExports = spvtest::LinkerTest;
 
 TEST_F(MatchingImportsToExports, Default) {
@@ -901,6 +903,114 @@ OpFunctionEnd
         GetErrorMessage(),
         HasSubstr("Type mismatch on symbol \"foo\" between imported "
                   "variable/function %1 and exported variable/function %11"));
+  }
+}
+
+TEST_F(MatchingImportsToExports, LinkOnceODRLinkageHandling) {
+  // clang-format off
+  auto body1WithLinkageType = [](const std::string& linkageType) {
+    return R"(
+OpCapability Linkage
+OpCapability Addresses
+OpCapability Kernel
+OpExtension "SPV_KHR_linkonce_odr"
+OpMemoryModel Physical64 OpenCL
+OpDecorate %1 LinkageAttributes "foo" )" + linkageType + R"(
+OpDecorate %2 LinkageAttributes "bar" Import
+%3 = OpTypeFloat 32
+%1 = OpVariable %3 Uniform
+%2 = OpVariable %3 Uniform
+)";
+  };
+  // clang-format on
+
+  const std::string body2 = R"(
+OpCapability Linkage
+OpCapability Addresses
+OpCapability Kernel
+OpExtension "SPV_KHR_linkonce_odr"
+OpMemoryModel Physical64 OpenCL
+OpDecorate %1 LinkageAttributes "foo" LinkOnceODR
+OpDecorate %2 LinkageAttributes "bar" Export
+%3 = OpTypeFloat 32
+%4 = OpConstant %3 2.7183
+%1 = OpVariable %3 Uniform %4
+%5 = OpConstant %3 3.1415
+%2 = OpVariable %3 Uniform %5
+)";
+
+  auto linkageTypes = {"Import", "LinkOnceODR"};
+  for (const auto& type : linkageTypes) {
+    const std::string body1 = body1WithLinkageType(type);
+    spvtest::Binary linked_binary;
+    EXPECT_EQ(SPV_SUCCESS, AssembleAndLink({body1, body2}, &linked_binary))
+        << GetErrorMessage();
+  }
+}
+
+TEST_F(MatchingImportsToExports, LinkOnceODRFunctionSignatureMismatch) {
+  // clang-format off
+  auto body1WithLinkageType = [](const std::string& linkageType) {
+    return R"(
+OpCapability Linkage
+OpCapability Addresses
+OpCapability Kernel
+OpExtension "SPV_KHR_linkonce_odr"
+OpMemoryModel Physical64 OpenCL
+OpName %1 "foo"
+OpName %3 "param"
+OpDecorate %1 LinkageAttributes "foo" )" + linkageType + R"(
+ %5 = OpTypeVoid
+ %6 = OpTypeInt 8 0
+ %7 = OpTypeFunction %5 %6
+ %1 = OpFunction %5 None %7
+ %3 = OpFunctionParameter %6
+OpFunctionEnd
+ %8 = OpFunction %5 None %7
+ %4 = OpFunctionParameter %6
+%10 = OpLabel
+%11 = OpFunctionCall %5 %1 %4
+OpReturn
+OpFunctionEnd
+)";
+  };
+  // clang-format on
+
+  const std::string body2 = R"(
+OpCapability Linkage
+OpCapability Addresses
+OpCapability Kernel
+OpExtension "SPV_KHR_linkonce_odr"
+OpMemoryModel Physical64 OpenCL
+OpName %1 "foo"
+OpName %2 "param"
+OpDecorate %1 LinkageAttributes "foo" LinkOnceODR
+%3 = OpTypeVoid
+%4 = OpTypeInt 32 0
+%5 = OpTypeFunction %3 %4
+%1 = OpFunction %3 None %5
+%2 = OpFunctionParameter %4
+%6 = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto linkageTypes = {"Import", "LinkOnceODR"};
+  for (const auto& type : linkageTypes) {
+    const std::string body1 = body1WithLinkageType(type);
+    LinkerOptions options;
+    for (int i = 0; i < 2; i++) {
+      spvtest::Binary linked_binary;
+      options.SetAllowPtrTypeMismatch(i == 1);
+      ASSERT_EQ(SPV_ERROR_INVALID_BINARY,
+                AssembleAndLink({body1, body2}, &linked_binary))
+          << GetErrorMessage();
+      EXPECT_THAT(
+          GetErrorMessage(),
+          MatchesRegex(".*Type mismatch on symbol \"foo\" between imported "
+                       "variable/function (%1 and exported variable/function "
+                       "%10|%10 and exported variable/function %1).*"));
+    }
   }
 }
 
